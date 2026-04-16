@@ -4,15 +4,18 @@ import random
 from datetime import datetime
 from pathlib import Path
 
+# --- НОВЫЕ СТРОКИ ДЛЯ РАБОТЫ С .env ---
+from dotenv import load_dotenv  # Импортируем библиотеку для работы с .env
+load_dotenv()                  # Загружаем переменные из .env файла
+# ------------------------------------
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from scraper import search
-from database import add_query, remove_query, list_queries, get_all_queries, is_item_sent, mark_item_sent
-from utils import send_photo_with_caption, format_item_message
+# ... остальной код бота ...
 
 # ---------- Настройки ----------
-TOKEN = os.environ.get("YOKU_BOT_TOKEN")
+TOKEN = os.environ.get("YOKU_BOT_TOKEN")  # Теперь код читает переменную, но уже из файла
 if not TOKEN:
     raise ValueError("Переменная окружения YOKU_BOT_TOKEN не установлена")
 
