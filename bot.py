@@ -1,138 +1,519 @@
 import os
 import logging
 import random
-from datetime import datetime
-from pathlib import Path
+import asyncio
 
-# --- НОВЫЕ СТРОКИ ДЛЯ РАБОТЫ С .env ---
-from dotenv import load_dotenv  # Импортируем библиотеку для работы с .env
-load_dotenv()                  # Загружаем переменные из .env файла
-# ------------------------------------
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    ConversationHandler, ContextTypes, MessageHandler, filters
+)
 
-# ... остальной код бота ...
+from scraper import search_with_offset
+from database import (
+    add_subscription, remove_subscription, list_subscriptions,
+    get_all_subscriptions, is_item_sent, mark_item_sent
+)
+from utils import send_photo_with_caption, format_item_message, convert_price_to_rub
 
 # ---------- Настройки ----------
-TOKEN = os.environ.get("YOKU_BOT_TOKEN")  # Теперь код читает переменную, но уже из файла
+TOKEN = os.environ.get("API_TOKEN")
 if not TOKEN:
-    raise ValueError("Переменная окружения YOKU_BOT_TOKEN не установлена")
+    raise ValueError("Токен не найден в переменных окружения")
 
-MIN_INTERVAL_MIN = 10
-MAX_INTERVAL_MIN = 120
+# Состояния
+WAITING_BRAND_NAME = 1
+CHOOSING_MAIN_CAT = 2
+CHOOSING_WOMEN_SUBCAT = 3
+WAITING_BRAND_FOR_SEARCH = 4
+CHOOSING_MAIN_CAT_FOR_SEARCH = 5
+CHOOSING_WOMEN_SUBCAT_FOR_SEARCH = 6
+SEARCH_ACTIVE = 7
+
+MAIN_CATEGORIES = {
+    "👕 Футболки": "Tシャツ",
+    "👕 Худи/Свитшоты": "パーカー",
+    "🧥 Куртки/Пальто": "ジャケット",
+    "👖 Штаны/Джинсы": "パンツ",
+    "👟 Обувь": "靴",
+    "💍 Аксессуары": "アクセサリー",
+    "👗 Женское": "women",
+    "📦 Всё подряд": "all"
+}
+
+WOMEN_SUBCATEGORIES = {
+    "👗 Платья": "ワンピース",
+    "📏 Юбки": "スカート",
+    "👠 Каблуки/Туфли": "ハイヒール",
+    "🔙 Назад": "back"
+}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Обработчики команд ----------
+def get_search_query(brand: str, category_code: str) -> str:
+    if category_code and category_code != "all":
+        return f"{brand} {category_code}"
+    return brand
+
+def get_category_display(category_code: str) -> str:
+    if not category_code:
+        return "все категории"
+    for name, code in MAIN_CATEGORIES.items():
+        if code == category_code:
+            return name
+    for name, code in WOMEN_SUBCATEGORIES.items():
+        if code == category_code:
+            return name
+    return category_code
+
+# ---------- Главное меню ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    text = (
-        "👋 Привет! Я бот для отслеживания новых лотов на Yahoo Auctions.\n\n"
-        "Команды:\n"
-        "/add_brand <бренд> – добавить бренд\n"
-        "/remove_brand <бренд> – удалить бренд\n"
-        "/my_brands – список брендов\n"
-        "/search_last <бренд> – последние 5 лотов\n\n"
-        "Пример: /add_brand undercover"
+    """Команда /start – показывает главное меню и завершает любой активный диалог."""
+    # Очищаем временные данные пользователя
+    context.user_data.clear()
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить бренд", callback_data="add_brand")],
+        [InlineKeyboardButton("📋 Мои бренды", callback_data="my_brands")],
+        [InlineKeyboardButton("🗑️ Удалить бренд", callback_data="remove_brand")],
+        [InlineKeyboardButton("🔍 Поиск последних лотов", callback_data="search_last")],
+    ]
+    await update.message.reply_text(
+        "👋 Главное меню. Выберите действие:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
-    await update.message.reply_text(text)
+    return ConversationHandler.END  # Завершаем любой активный диалог
 
-async def add_brand(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    if not context.args:
-        await update.message.reply_text("Укажите бренд: /add_brand nike")
-        return
-    brand = " ".join(context.args).lower()
-    add_query(chat_id, brand)
-    await update.message.reply_text(f"✅ Бренд '{brand}' добавлен.")
+async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data
 
-async def remove_brand(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    if not context.args:
-        await update.message.reply_text("Укажите бренд: /remove_brand nike")
-        return
-    brand = " ".join(context.args).lower()
-    remove_query(chat_id, brand)
-    await update.message.reply_text(f"🗑️ Бренд '{brand}' удалён.")
-
-async def my_brands(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    brands = list_queries(chat_id)
-    if not brands:
-        await update.message.reply_text("📭 У вас нет отслеживаемых брендов.")
+    if action == "add_brand":
+        await query.edit_message_text(
+            "✏️ Напишите название бренда (например, nike).\n\n"
+            "Или нажмите «Отмена», чтобы вернуться в главное меню.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
+        )
+        return WAITING_BRAND_NAME
+    elif action == "my_brands":
+        chat_id = str(update.effective_chat.id)
+        subs = list_subscriptions(chat_id)
+        if not subs:
+            text = "📭 У вас нет отслеживаемых брендов."
+        else:
+            lines = [f"• {brand} – *{get_category_display(cat)}*" for brand, cat in subs]
+            text = "📋 Ваши подписки:\n" + "\n".join(lines)
+        await query.edit_message_text(text, parse_mode="Markdown")
+        # Показываем главное меню через 3 секунды
+        await asyncio.sleep(3)
+        keyboard = [
+            [InlineKeyboardButton("➕ Добавить бренд", callback_data="add_brand")],
+            [InlineKeyboardButton("📋 Мои бренды", callback_data="my_brands")],
+            [InlineKeyboardButton("🗑️ Удалить бренд", callback_data="remove_brand")],
+            [InlineKeyboardButton("🔍 Поиск последних лотов", callback_data="search_last")],
+        ]
+        await query.message.reply_text("Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return ConversationHandler.END
+    elif action == "remove_brand":
+        chat_id = str(update.effective_chat.id)
+        subs = list_subscriptions(chat_id)
+        if not subs:
+            await query.edit_message_text("📭 У вас нет активных подписок.")
+            await asyncio.sleep(2)
+            keyboard = [
+                [InlineKeyboardButton("➕ Добавить бренд", callback_data="add_brand")],
+                [InlineKeyboardButton("📋 Мои бренды", callback_data="my_brands")],
+                [InlineKeyboardButton("🗑️ Удалить бренд", callback_data="remove_brand")],
+                [InlineKeyboardButton("🔍 Поиск последних лотов", callback_data="search_last")],
+            ]
+            await query.message.reply_text("Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
+            return ConversationHandler.END
+        keyboard = []
+        for brand, cat_code in subs:
+            display = f"{brand} [{get_category_display(cat_code)}]"
+            keyboard.append([InlineKeyboardButton(display, callback_data=f"del_{brand}_{cat_code}")])
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")])
+        await query.edit_message_text("Выберите подписку для удаления:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return None  # Остаёмся в том же диалоге, но обработка в отдельном хендлере
+    elif action == "search_last":
+        await query.edit_message_text(
+            "✏️ Напишите название бренда для поиска (например, nike).\n\n"
+            "Или нажмите «Отмена», чтобы вернуться в главное меню.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
+        )
+        return WAITING_BRAND_FOR_SEARCH
     else:
-        await update.message.reply_text("📋 Ваши бренды:\n" + "\n".join(f"• {b}" for b in brands))
+        await query.edit_message_text("Неизвестная команда")
+        return ConversationHandler.END
 
-async def search_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- Добавление бренда ----------
+async def receive_brand_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    brand = update.message.text.strip().lower()
+    if not brand:
+        await update.message.reply_text("Пожалуйста, напишите бренд текстом.")
+        return WAITING_BRAND_NAME
+    context.user_data["temp_brand"] = brand
+    keyboard = [[InlineKeyboardButton(name, callback_data=code)] for name, code in MAIN_CATEGORIES.items()]
+    await update.message.reply_text(
+        f"Бренд: *{brand}*\nТеперь выберите категорию:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CHOOSING_MAIN_CAT
+
+async def add_main_category_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data
+    if choice == "women":
+        keyboard = [[InlineKeyboardButton(name, callback_data=code)] for name, code in WOMEN_SUBCATEGORIES.items()]
+        await query.edit_message_text("Выберите женскую категорию:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return CHOOSING_WOMEN_SUBCAT
+    else:
+        return await save_subscription(update, context, choice)
+
+async def add_women_subcategory_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data
+    if choice == "back":
+        brand = context.user_data.get("temp_brand")
+        keyboard = [[InlineKeyboardButton(name, callback_data=code)] for name, code in MAIN_CATEGORIES.items()]
+        await query.edit_message_text(
+            f"Бренд: *{brand}*\nВыберите категорию:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return CHOOSING_MAIN_CAT
+    else:
+        return await save_subscription(update, context, choice)
+
+async def save_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE, category_code: str):
+    query = update.callback_query
+    brand = context.user_data.get("temp_brand")
     chat_id = str(update.effective_chat.id)
-    if not context.args:
-        await update.message.reply_text("Укажите бренд: /search_last undercover")
-        return
-    brand = " ".join(context.args)
-    await update.message.reply_text(f"🔍 Ищу последние 5 лотов по '{brand}'...")
+    if not brand:
+        await query.edit_message_text("❌ Ошибка. Попробуйте снова через главное меню.")
+        return ConversationHandler.END
+    if category_code == "all":
+        category_code = ""
+    success = add_subscription(chat_id, brand, category_code)
+    cat_display = get_category_display(category_code)
+    if success:
+        await query.edit_message_text(
+            f"✅ Подписка добавлена:\nБренд: *{brand}*\nКатегория: *{cat_display}*",
+            parse_mode="Markdown"
+        )
+    else:
+        await query.edit_message_text(f"⚠️ Подписка на {brand} с такой категорией уже существует.")
+    context.user_data.pop("temp_brand", None)
+    # Показываем главное меню
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить бренд", callback_data="add_brand")],
+        [InlineKeyboardButton("📋 Мои бренды", callback_data="my_brands")],
+        [InlineKeyboardButton("🗑️ Удалить бренд", callback_data="remove_brand")],
+        [InlineKeyboardButton("🔍 Поиск последних лотов", callback_data="search_last")],
+    ]
+    await query.message.reply_text("Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return ConversationHandler.END
+
+# ---------- Удаление бренда ----------
+async def remove_brand_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data == "back_to_main":
+        keyboard = [
+            [InlineKeyboardButton("➕ Добавить бренд", callback_data="add_brand")],
+            [InlineKeyboardButton("📋 Мои бренды", callback_data="my_brands")],
+            [InlineKeyboardButton("🗑️ Удалить бренд", callback_data="remove_brand")],
+            [InlineKeyboardButton("🔍 Поиск последних лотов", callback_data="search_last")],
+        ]
+        await query.edit_message_text("Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return ConversationHandler.END
+    elif data.startswith("del_"):
+        parts = data.split("_", 2)
+        if len(parts) == 3:
+            _, brand, cat_code = parts
+            chat_id = str(update.effective_chat.id)
+            remove_subscription(chat_id, brand, cat_code)
+            await query.edit_message_text(f"🗑️ Подписка на {brand} (категория: {get_category_display(cat_code)}) удалена.")
+            # Возвращаем главное меню
+            keyboard = [
+                [InlineKeyboardButton("➕ Добавить бренд", callback_data="add_brand")],
+                [InlineKeyboardButton("📋 Мои бренды", callback_data="my_brands")],
+                [InlineKeyboardButton("🗑️ Удалить бренд", callback_data="remove_brand")],
+                [InlineKeyboardButton("🔍 Поиск последних лотов", callback_data="search_last")],
+            ]
+            await query.message.reply_text("Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
+            return ConversationHandler.END
+    return ConversationHandler.END
+
+# ---------- Поиск лотов ----------
+async def receive_brand_for_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    brand = update.message.text.strip().lower()
+    if not brand:
+        await update.message.reply_text("Пожалуйста, напишите бренд текстом.")
+        return WAITING_BRAND_FOR_SEARCH
+    context.user_data["temp_search_brand"] = brand
+    keyboard = [[InlineKeyboardButton(name, callback_data=code)] for name, code in MAIN_CATEGORIES.items()]
+    await update.message.reply_text(
+        f"Бренд: *{brand}*\nВыберите категорию для поиска:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CHOOSING_MAIN_CAT_FOR_SEARCH
+
+async def search_main_category_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data
+    if choice == "women":
+        keyboard = [[InlineKeyboardButton(name, callback_data=code)] for name, code in WOMEN_SUBCATEGORIES.items()]
+        await query.edit_message_text("Выберите женскую категорию:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return CHOOSING_WOMEN_SUBCAT_FOR_SEARCH
+    else:
+        return await start_search(update, context, choice, offset=0)
+
+async def search_women_subcategory_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data
+    if choice == "back":
+        brand = context.user_data.get("temp_search_brand")
+        keyboard = [[InlineKeyboardButton(name, callback_data=code)] for name, code in MAIN_CATEGORIES.items()]
+        await query.edit_message_text(
+            f"Бренд: *{brand}*\nВыберите категорию для поиска:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return CHOOSING_MAIN_CAT_FOR_SEARCH
+    else:
+        return await start_search(update, context, choice, offset=0)
+
+async def start_search(update: Update, context: ContextTypes.DEFAULT_TYPE, category_code: str, offset: int):
+    query = update.callback_query
+    brand = context.user_data.get("temp_search_brand")
+    chat_id = str(update.effective_chat.id)
+    if not brand:
+        await query.edit_message_text("❌ Ошибка. Попробуйте снова через главное меню.")
+        return ConversationHandler.END
+
+    if category_code == "all":
+        category_code = ""
+    search_query = get_search_query(brand, category_code)
+
+    context.user_data["search_params"] = {
+        "brand": brand,
+        "category_code": category_code,
+        "search_query": search_query
+    }
+
+    cat_display = get_category_display(category_code)
+    await query.edit_message_text(f"🔍 Ищу лоты: *{search_query}* (категория: {cat_display})", parse_mode="Markdown")
+
     try:
-        results = search(brand, count=5)
+        results = search_with_offset(search_query, limit=5, offset=offset)
         if not results:
-            await update.message.reply_text(f"❌ Ничего не найдено по '{brand}'.")
-            return
-        for item in results[:5]:
+            await query.message.reply_text(f"❌ Ничего не найдено по '{search_query}'.")
+            context.user_data.pop("search_params", None)
+            # Показываем главное меню
+            keyboard = [
+                [InlineKeyboardButton("➕ Добавить бренд", callback_data="add_brand")],
+                [InlineKeyboardButton("📋 Мои бренды", callback_data="my_brands")],
+                [InlineKeyboardButton("🗑️ Удалить бренд", callback_data="remove_brand")],
+                [InlineKeyboardButton("🔍 Поиск последних лотов", callback_data="search_last")],
+            ]
+            await query.message.reply_text("Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
+            return ConversationHandler.END
+
+        for item in results:
             caption = format_item_message(item)
             await send_photo_with_caption(context.bot, chat_id, item["img"], caption)
+            await asyncio.sleep(0.5)
+
+        if len(results) == 5:
+    keyboard = [
+        [InlineKeyboardButton("📦 Ещё 5", callback_data=f"more_{offset+5}")],
+        [InlineKeyboardButton("🔄 Другая категория", callback_data="change_category")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="to_main_menu")]
+    ]
+    await query.message.reply_text(
+        "Показаны первые 5. Нажмите «Ещё», чтобы загрузить следующие.\n"
+        "Или выберите другую категорию или главное меню.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return SEARCH_ACTIVE
+else:
+    # Лотов меньше 5 – больше нет, показываем кнопки смены категории и главного меню
+    keyboard = [
+        [InlineKeyboardButton("🔄 Другая категория", callback_data="change_category")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="to_main_menu")]
+    ]
+    await query.message.reply_text(
+        "✅ Поиск завершён. Больше лотов нет.\n"
+        "Можете выбрать другую категорию или вернуться в главное меню.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    context.user_data.pop("search_params", None)
+    return SEARCH_ACTIVE  # остаёмся в активном поиске, чтобы обработать нажатие
+            context.user_data.pop("search_params", None)
+            keyboard = [
+                [InlineKeyboardButton("➕ Добавить бренд", callback_data="add_brand")],
+                [InlineKeyboardButton("📋 Мои бренды", callback_data="my_brands")],
+                [InlineKeyboardButton("🗑️ Удалить бренд", callback_data="remove_brand")],
+                [InlineKeyboardButton("🔍 Поиск последних лотов", callback_data="search_last")],
+            ]
+            await query.message.reply_text("Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
+            return ConversationHandler.END
     except Exception as e:
         logger.exception("Ошибка при поиске")
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+        await query.message.reply_text(f"❌ Ошибка: {e}")
+        context.user_data.pop("search_params", None)
+        return ConversationHandler.END
 
-# ---------- Фоновая проверка (Job) ----------
-async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
-    """Проверяет все подписки и отправляет новые товары."""
-    all_queries = get_all_queries()
-    if not all_queries:
-        return
-    logger.info(f"Плановая проверка для {len(all_queries)} подписок...")
-    for chat_id, query in all_queries:
+async def more_results_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith("more_"):
+        new_offset = int(data.split("_")[1])
+        params = context.user_data.get("search_params")
+        if not params:
+            await query.edit_message_text("❌ Сессия поиска истекла. Начните заново через главное меню.")
+            return ConversationHandler.END
+
+        brand = params["brand"]
+        category_code = params["category_code"]
+        search_query = params["search_query"]
+        chat_id = str(update.effective_chat.id)
+
         try:
-            results = search(query, count=10)  # проверим последние 10
+            results = search_with_offset(search_query, limit=5, offset=new_offset)
+            if not results:
+                await query.edit_message_text("❌ Больше ничего не найдено.")
+                context.user_data.pop("search_params", None)
+                keyboard = [
+                    [InlineKeyboardButton("➕ Добавить бренд", callback_data="add_brand")],
+                    [InlineKeyboardButton("📋 Мои бренды", callback_data="my_brands")],
+                    [InlineKeyboardButton("🗑️ Удалить бренд", callback_data="remove_brand")],
+                    [InlineKeyboardButton("🔍 Поиск последних лотов", callback_data="search_last")],
+                ]
+                await query.message.reply_text("Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
+                return ConversationHandler.END
+
+            await query.message.delete()
+            for item in results:
+                caption = format_item_message(item)
+                await send_photo_with_caption(context.bot, chat_id, item["img"], caption)
+                await asyncio.sleep(0.5)
+
+            if len(results) == 5:
+                keyboard = [[InlineKeyboardButton("📦 Ещё 5", callback_data=f"more_{new_offset+5}")]]
+                await query.message.reply_text(f"Показаны следующие 5. Нажмите «Ещё», чтобы продолжить.", reply_markup=InlineKeyboardMarkup(keyboard))
+                return SEARCH_ACTIVE
+            else:
+                await query.message.reply_text("✅ Больше лотов нет.")
+                context.user_data.pop("search_params", None)
+                keyboard = [
+                    [InlineKeyboardButton("➕ Добавить бренд", callback_data="add_brand")],
+                    [InlineKeyboardButton("📋 Мои бренды", callback_data="my_brands")],
+                    [InlineKeyboardButton("🗑️ Удалить бренд", callback_data="remove_brand")],
+                    [InlineKeyboardButton("🔍 Поиск последних лотов", callback_data="search_last")],
+                ]
+                await query.message.reply_text("Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
+                return ConversationHandler.END
+        except Exception as e:
+            logger.exception("Ошибка при пагинации")
+            await query.message.reply_text(f"❌ Ошибка: {e}")
+            context.user_data.pop("search_params", None)
+            return ConversationHandler.END
+
+# ---------- Отмена диалога ----------
+async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить бренд", callback_data="add_brand")],
+        [InlineKeyboardButton("📋 Мои бренды", callback_data="my_brands")],
+        [InlineKeyboardButton("🗑️ Удалить бренд", callback_data="remove_brand")],
+        [InlineKeyboardButton("🔍 Поиск последних лотов", callback_data="search_last")],
+    ]
+    await query.edit_message_text("✅ Диалог отменён. Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return ConversationHandler.END
+
+# ---------- Фоновая проверка ----------
+async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
+    all_subs = get_all_subscriptions()
+    if not all_subs:
+        return
+    logger.info(f"Плановая проверка для {len(all_subs)} подписок...")
+    for chat_id, brand, category_code in all_subs:
+        query_str = get_search_query(brand, category_code)
+        try:
+            results = search_with_offset(query_str, limit=10, offset=0)
             for item in results:
                 if not is_item_sent(chat_id, item["item_id"]):
                     caption = format_item_message(item)
+                    await context.bot.send_message(chat_id=chat_id, text=f"🆕 Новый лот по запросу '{query_str}':")
                     await send_photo_with_caption(context.bot, chat_id, item["img"], caption)
                     mark_item_sent(chat_id, item["item_id"], item)
-                    # Небольшая задержка между отправками, чтобы не флудить
                     await asyncio.sleep(1)
         except Exception as e:
-            logger.error(f"Ошибка при проверке {query} для {chat_id}: {e}")
-    # После проверки перенастроим интервал случайным образом
-    new_interval = random.randint(MIN_INTERVAL_MIN, MAX_INTERVAL_MIN) * 60
-    job = context.job
-    if job:
-        job.interval = new_interval
-        logger.info(f"Следующая проверка через {new_interval//60} минут")
+            logger.error(f"Ошибка при проверке {brand}/{category_code}: {e}")
+
+async def post_init(app: Application):
+    interval = random.randint(10, 120) * 60
+    app.job_queue.run_repeating(periodic_check, interval=interval, first=10)
+    logger.info(f"Планировщик запущен, интервал {interval//60} минут")
 
 # ---------- Запуск ----------
-async def post_init(application: Application):
-    """После запуска бота добавляем периодическую задачу с случайным интервалом."""
-    interval = random.randint(MIN_INTERVAL_MIN, MAX_INTERVAL_MIN) * 60
-    application.job_queue.run_repeating(
-        periodic_check,
-        interval=interval,
-        first=10,
-        name="yahoo_checker"
-    )
-    logger.info(f"Планировщик запущен: интервал {interval//60} минут")
-
 def main():
     app = Application.builder().token(TOKEN).build()
+
+    # Диалог добавления бренда
+    add_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(main_menu_callback, pattern="^add_brand$")],
+        states={
+            WAITING_BRAND_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_brand_name),
+                CallbackQueryHandler(cancel_callback, pattern="^cancel$")
+            ],
+            CHOOSING_MAIN_CAT: [CallbackQueryHandler(add_main_category_chosen)],
+            CHOOSING_WOMEN_SUBCAT: [CallbackQueryHandler(add_women_subcategory_chosen)],
+        },
+        fallbacks=[CommandHandler("start", start)],
+        allow_reentry=True,
+    )
+
+    # Диалог поиска
+    search_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(main_menu_callback, pattern="^search_last$")],
+        states={
+            WAITING_BRAND_FOR_SEARCH: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_brand_for_search),
+                CallbackQueryHandler(cancel_callback, pattern="^cancel$")
+            ],
+            CHOOSING_MAIN_CAT_FOR_SEARCH: [CallbackQueryHandler(search_main_category_chosen)],
+            CHOOSING_WOMEN_SUBCAT_FOR_SEARCH: [CallbackQueryHandler(search_women_subcategory_chosen)],
+            SEARCH_ACTIVE: [CallbackQueryHandler(more_results_callback, pattern="^more_")],
+        },
+        fallbacks=[CommandHandler("start", start)],
+        allow_reentry=True,
+    )
+
+    app.add_handler(add_conv)
+    app.add_handler(search_conv)
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add_brand", add_brand))
-    app.add_handler(CommandHandler("remove_brand", remove_brand))
-    app.add_handler(CommandHandler("my_brands", my_brands))
-    app.add_handler(CommandHandler("search_last", search_last))
+    app.add_handler(CallbackQueryHandler(main_menu_callback, pattern="^(my_brands|remove_brand)$"))
+    app.add_handler(CallbackQueryHandler(remove_brand_callback, pattern="^(del_|back_to_main)"))
+    app.add_handler(CallbackQueryHandler(cancel_callback, pattern="^cancel$"))  # на случай, если cancel прилетит вне диалога
 
     app.post_init = post_init
     app.run_polling()
 
 if __name__ == "__main__":
-    import asyncio
     main()
